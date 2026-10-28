@@ -1018,8 +1018,8 @@ static int mdlThreadMain(int argc, const char **argv)
 
                 // Keep the old resume contract: after a failure, only the longest
                 // fully completed prefix is retained. Later chunks are truncated.
-                while(contiguousChunks < chunkCount &&
-                      (dlCompleted[contiguousChunks >> 3] & (uint8_t)(1U << (contiguousChunks & 7))))
+                while(contiguousChunks < chunkCount
+                      && (dlCompleted[contiguousChunks >> 3] & (uint8_t)(1U << (contiguousChunks & 7))))
                 {
                     curl_off_t chunkStart = job->start + (curl_off_t)contiguousChunks * DL_CHUNKSIZE;
                     curl_off_t remaining = job->end - chunkStart;
