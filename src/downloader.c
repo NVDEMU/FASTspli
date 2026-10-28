@@ -22,7 +22,9 @@
 #include <dirent.h>
 #include <errno.h>
 #include <netinet/tcp.h>
+#include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <ac_wrapper.h>
 #include <config.h>
