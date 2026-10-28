@@ -98,6 +98,9 @@
 // for the largest ask in every build, not just for the benchmark.
 #define DL_MAX_STREAMS 6
 #define DL_MAX_SLOTS   (DL_MAX_STREAMS * 2)
+// Content sizes are 32-bit in the Wii U TMD; at 1 MiB per range the largest
+// representable file needs at most 4096 completion bits.
+#define DL_MAX_CHUNKS 4096
 // Below this the extra connections cost more than they win, and the .h3, ticket
 // and TMD files are tiny to begin with.
 #define DL_MIN_PARALLEL (2 * DL_CHUNKSIZE)
@@ -135,6 +138,7 @@ typedef struct
     curl_off_t start; // first byte we still need
     curl_off_t end; // one past the last byte of the file
     volatile void *cdata;
+    bool outOfOrder;
 } dlJob;
 
 static dlChunk dlSlots[DL_MAX_SLOTS];
@@ -145,6 +149,10 @@ static int dlSlotCount = DL_SLOTS;
 // CURLMOPT_MAX_TOTAL_CONNECTIONS below.
 static CURL *dlHandles[DL_MAX_SLOTS];
 static bool parallelReady = false;
+// The downloader has one active job at a time. This bitmap remembers which
+// out-of-order chunks reached the I/O queue so a failed job can keep only the
+// contiguous prefix that the existing size-based resume logic understands.
+static uint8_t dlCompleted[(DL_MAX_CHUNKS + 7) / 8];
 
 // Point the engine at the stream count the next job should use: one pair of
 // slots per stream, capped by the arrays sized above.
@@ -828,6 +836,17 @@ static curl_off_t chunkedProgress(curl_off_t written, curl_off_t start)
     return p;
 }
 
+// For out-of-order mode, count every queued range plus bytes still in flight;
+// the contiguous-prefix counter is reserved for safe resume after a failure.
+static curl_off_t chunkedProgressOutOfOrder(curl_off_t completed)
+{
+    curl_off_t p = completed;
+    for(int i = 0; i < dlSlotCount; ++i)
+        p += dlSlots[i].filled;
+
+    return p;
+}
+
 // Slots are handed out and drained in the same cyclic order, so the chunk that
 // has to be written next is always the one at nextWrite - no search, no
 // reordering buffer, and the file on disk is always a valid prefix of itself,
@@ -847,10 +866,25 @@ static int mdlThreadMain(int argc, const char **argv)
 
     CURLcode ret = CURLE_OK;
     curl_off_t issue = job->start; // next byte to hand to a stream
-    curl_off_t written = job->start; // next byte to hand to the I/O queue
+    curl_off_t written = job->start; // next byte to hand to the sequential I/O queue
+    curl_off_t outOfOrderBytes = 0; // total ranges queued in positioned-write mode
+    curl_off_t contiguousBytes = 0; // safe prefix that survives a failed transfer
+    uint32_t chunkCount = (uint32_t)(((job->end - job->start) + DL_CHUNKSIZE - 1) / DL_CHUNKSIZE);
+    uint32_t contiguousChunks = 0;
     int nextIssue = 0;
     int nextWrite = 0;
     char range[48];
+
+    if(job->outOfOrder)
+    {
+        if(chunkCount > DL_MAX_CHUNKS)
+        {
+            debugPrintf("Out-of-order download disabled: too many chunks (%u)", chunkCount);
+            job->outOfOrder = false;
+        }
+        else
+            memset(dlCompleted, 0, sizeof(dlCompleted));
+    }
 
     for(int i = 0; i < dlSlotCount; ++i)
     {
@@ -862,13 +896,25 @@ static int mdlThreadMain(int argc, const char **argv)
     // Published on either side of the blocking write below: while a commit waits
     // on the disk nothing else refreshes the figure, and the screen would pair
     // its next byte count with a stale tick.
-#define updateProgress() publishProgress(cdata, job->end - job->start, chunkedProgress(written, job->start))
+#define updateProgress() publishProgress(cdata, job->end - job->start, job->outOfOrder ? chunkedProgressOutOfOrder(outOfOrderBytes) : chunkedProgress(written, job->start))
 
     while(true)
     {
-        while(issue < job->end && dlSlots[nextIssue].handle == NULL && !dlSlots[nextIssue].full)
+        // Search all slots, not only the next cyclic slot. In out-of-order mode a
+        // slow early range can leave that slot busy while later slots have already
+        // been written and freed; stopping at the busy slot would idle the streams.
+        int scanned = 0;
+        while(issue < job->end && scanned < dlSlotCount)
         {
             dlChunk *chunk = dlSlots + nextIssue;
+            if(chunk->handle != NULL || chunk->full)
+            {
+                if(++nextIssue == dlSlotCount)
+                    nextIssue = 0;
+                ++scanned;
+                continue;
+            }
+
             curl_off_t len = job->end - issue;
             if(len > DL_CHUNKSIZE)
                 len = DL_CHUNKSIZE;
@@ -888,6 +934,7 @@ static int mdlThreadMain(int argc, const char **argv)
             issue += len;
             if(++nextIssue == dlSlotCount)
                 nextIssue = 0;
+            scanned = 0;
         }
 
         if(ret != CURLE_OK)
@@ -946,23 +993,62 @@ static int mdlThreadMain(int argc, const char **argv)
 
         updateProgress();
 
-        while(dlSlots[nextWrite].full)
+        if(job->outOfOrder)
         {
-            dlChunk *chunk = dlSlots + nextWrite;
-            if(addToIOQueue(chunk->buf, 1, chunk->size, job->fp) != chunk->size)
+            // Commit any completed range immediately at its actual offset. This
+            // lets faster streams keep working even when an earlier range is slow.
+            for(int i = 0; i < dlSlotCount; ++i)
             {
-                ret = CURLE_WRITE_ERROR;
-                break;
-            }
+                dlChunk *chunk = dlSlots + i;
+                if(!chunk->full)
+                    continue;
 
-            written += chunk->size;
-            chunk->size = chunk->filled = 0;
-            chunk->full = false;
-            if(++nextWrite == dlSlotCount)
-                nextWrite = 0;
+                size_t chunkSize = chunk->size;
+                if(addToIOQueueAt(chunk->buf, chunkSize, job->fp, (uint32_t)chunk->start) != chunkSize)
+                {
+                    ret = CURLE_WRITE_ERROR;
+                    break;
+                }
+
+                uint32_t index = (uint32_t)((chunk->start - job->start) / DL_CHUNKSIZE);
+                dlCompleted[index >> 3] |= (uint8_t)(1U << (index & 7));
+                outOfOrderBytes += chunkSize;
+
+                // Keep the old resume contract: after a failure, only the longest
+                // fully completed prefix is retained. Later chunks are truncated.
+                while(contiguousChunks < chunkCount &&
+                      (dlCompleted[contiguousChunks >> 3] & (uint8_t)(1U << (contiguousChunks & 7))))
+                {
+                    curl_off_t chunkStart = job->start + (curl_off_t)contiguousChunks * DL_CHUNKSIZE;
+                    curl_off_t remaining = job->end - chunkStart;
+                    contiguousBytes += remaining > DL_CHUNKSIZE ? DL_CHUNKSIZE : remaining;
+                    ++contiguousChunks;
+                }
+
+                chunk->size = chunk->filled = 0;
+                chunk->full = false;
+            }
+        }
+        else
+        {
+            while(dlSlots[nextWrite].full)
+            {
+                dlChunk *chunk = dlSlots + nextWrite;
+                if(addToIOQueue(chunk->buf, 1, chunk->size, job->fp) != chunk->size)
+                {
+                    ret = CURLE_WRITE_ERROR;
+                    break;
+                }
+
+                written += chunk->size;
+                chunk->size = chunk->filled = 0;
+                chunk->full = false;
+                if(++nextWrite == dlSlotCount)
+                    nextWrite = 0;
+            }
         }
 
-        if(ret != CURLE_OK || written >= job->end)
+        if(ret != CURLE_OK || (job->outOfOrder ? outOfOrderBytes >= job->end - job->start : written >= job->end))
             break;
 
         updateProgress();
@@ -1047,11 +1133,16 @@ static int mdlThreadMain(int argc, const char **argv)
             dlSlots[i].handle = NULL;
         }
 
-    // Slots that still hold bytes are dropped when the next phase resets them,
-    // so the queue count is the only offset a continued transfer may resume at.
-    // Publishing it after the loop keeps it exact: while the transfer runs, the
-    // progress figure still counts the bytes sitting in those slots.
-    cdata->written = written - job->start;
+    // Positional writes can leave completed ranges beyond a gap. Queue a truncate
+    // after all queued writes so failure/cancel still leaves a valid prefix for the
+    // existing size-based resume logic. The I/O thread serializes this after writes.
+    if(job->outOfOrder && ret != CURLE_OK)
+        truncateIOFileAt(job->fp, (uint32_t)(job->start + contiguousBytes));
+
+    // Ramp phases still use ordered writes, so their score is the contiguous prefix.
+    // Settled parallel transfers also publish only the contiguous prefix here; their
+    // total received count is tracked separately for the on-screen progress display.
+    cdata->written = job->outOfOrder ? contiguousBytes : written - job->start;
     cdata->running = false;
     return ret;
 }
@@ -1376,6 +1467,9 @@ transfer:
         job.start = fileSize;
         job.end = data->cs;
         job.cdata = &cdata;
+        // Keep benchmark phases sequential so their rate comparison remains a
+        // like-for-like measurement. Once the count is chosen, use positioned writes.
+        job.outOfOrder = !ramping;
         argv[0] = (char *)&job;
         dlThread = startThread("NUSspli downloader", THREAD_PRIORITY_HIGH, STACKSIZE_BIG, mdlThreadMain, 1, (char *)argv, OS_THREAD_ATTRIB_AFFINITY_CPU0);
     }
@@ -1699,10 +1793,10 @@ transfer:
 
                 if(parallel)
                     // The ranges were ours, not a resume offset, so the server's
-                    // answer says nothing about whether it can resume. Chunks are
-                    // written in order, so what is on disk is a valid prefix -
-                    // throwing gigabytes away over one chunk's transient 503 would
-                    // be far worse than retrying on a single stream.
+                    // answer says nothing about whether it can resume. In settled
+                    // out-of-order mode, mdlThreadMain queued a truncate to the
+                    // contiguous prefix; the flush below completes that before retry.
+                    // Ramp phases still write a prefix in order.
                     allowParallel = false;
                 else
                     resume = false; // Sequential path failed too: no Range support.
