@@ -21,6 +21,7 @@
 #include <wut-fixups.h>
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #pragma GCC diagnostic ignored "-Wundef"
 #include <coreinit/filesystem_fsa.h>
