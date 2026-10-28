@@ -47,6 +47,9 @@ typedef struct WUT_PACKED
     volatile FSAFileHandle file;
     volatile size_t size;
     volatile uint8_t *buf;
+    volatile uint32_t offset;
+    volatile bool positional;
+    volatile bool truncate;
 } WriteQueueEntry;
 
 static OSThread *ioThread;
@@ -82,11 +85,27 @@ static int ioThreadMain(int argc, const char **argv)
 
         if(entry->size) // WRITE command
         {
-            err = FSAWriteFile(getFSAClient(), (void *)entry->buf, entry->size, 1, entry->file, 0);
+            if(entry->positional)
+                err = FSAWriteFileWithPos(getFSAClient(), (void *)entry->buf, entry->size, 1, entry->offset, entry->file, 0);
+            else
+                err = FSAWriteFile(getFSAClient(), (void *)entry->buf, entry->size, 1, entry->file, 0);
+
             if(err != 1)
                 goto ioError;
 
             entry->size = 0;
+        }
+        else if(entry->truncate) // Truncate after all earlier writes
+        {
+            err = FSASetPosFile(getFSAClient(), entry->file, entry->offset);
+            if(err != FS_ERROR_OK)
+                goto ioError;
+
+            err = FSATruncateFile(getFSAClient(), entry->file);
+            if(err != FS_ERROR_OK)
+                goto ioError;
+
+            entry->truncate = false;
         }
         else // Close command
         {
@@ -133,6 +152,9 @@ bool initIOThread()
                 queueEntries[i].file = 0;
                 queueEntries[i].size = 0;
                 queueEntries[i].buf = buf;
+                queueEntries[i].offset = 0;
+                queueEntries[i].positional = false;
+                queueEntries[i].truncate = false;
             }
 
             activeReadBuffer = activeWriteBuffer = 0;
@@ -188,6 +210,78 @@ void shutdownIOThread()
 // Hands the slot activeReadBuffer points to over to the I/O thread and advances to the next one.
 static inline void commitIOEntry(WriteQueueEntry *entry, FSAFileHandle file)
 {
+    entry->offset = 0;
+    entry->positional = false;
+    entry->truncate = false;
+    entry->file = file;
+    if(++activeReadBuffer == MAX_IO_QUEUE_ENTRIES)
+        activeReadBuffer = 0;
+}
+
+// Queue a full download chunk at its absolute file offset. Positional operations
+// occupy their own queue entry so they are never coalesced with sequential writes.
+size_t addToIOQueueAt(const void *buf, size_t size, FSAFileHandle file, uint32_t offset)
+{
+    if(checkForQueueErrors() || buf == NULL || size == 0 || size > IO_MAX_FILE_BUFFER)
+        return 0;
+
+retryAddingPositional:
+    ;
+    WriteQueueEntry *entry = queueEntries + activeReadBuffer;
+    if(entry->file != 0)
+    {
+        if(checkForQueueErrors())
+            return 0;
+        goto retryAddingPositional;
+    }
+
+    // A partially filled sequential buffer must be committed before a positional
+    // write gets its own slot. Download files always use the same handle here.
+    if(entry->size != 0)
+    {
+        commitIOEntry(entry, file);
+        goto retryAddingPositional;
+    }
+
+    OSBlockMove((void *)entry->buf, buf, size, false);
+    entry->size = size;
+    entry->offset = offset;
+    entry->positional = true;
+    entry->truncate = false;
+    entry->file = file;
+    if(++activeReadBuffer == MAX_IO_QUEUE_ENTRIES)
+        activeReadBuffer = 0;
+
+    return size;
+}
+
+// Queue a truncate after all previously queued writes to this file. This restores
+// a valid contiguous prefix for the existing size-based resume mechanism.
+void truncateIOFileAt(FSAFileHandle file, uint32_t offset)
+{
+    if(checkForQueueErrors())
+        return;
+
+retryQueueTruncate:
+    ;
+    WriteQueueEntry *entry = queueEntries + activeReadBuffer;
+    if(entry->file != 0)
+    {
+        if(checkForQueueErrors())
+            return;
+        goto retryQueueTruncate;
+    }
+
+    if(entry->size != 0)
+    {
+        commitIOEntry(entry, file);
+        goto retryQueueTruncate;
+    }
+
+    entry->size = 0;
+    entry->offset = offset;
+    entry->positional = false;
+    entry->truncate = true;
     entry->file = file;
     if(++activeReadBuffer == MAX_IO_QUEUE_ENTRIES)
         activeReadBuffer = 0;
