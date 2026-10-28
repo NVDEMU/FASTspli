@@ -225,8 +225,7 @@ size_t addToIOQueueAt(const void *buf, size_t size, FSAFileHandle file, uint32_t
     if(checkForQueueErrors() || buf == NULL || size == 0 || size > IO_MAX_FILE_BUFFER)
         return 0;
 
-retryAddingPositional:
-    ;
+retryAddingPositional:;
     WriteQueueEntry *entry = queueEntries + activeReadBuffer;
     if(entry->file != 0)
     {
@@ -262,8 +261,7 @@ void truncateIOFileAt(FSAFileHandle file, uint32_t offset)
     if(checkForQueueErrors())
         return;
 
-retryQueueTruncate:
-    ;
+retryQueueTruncate:;
     WriteQueueEntry *entry = queueEntries + activeReadBuffer;
     if(entry->file != 0)
     {
