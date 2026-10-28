@@ -40,6 +40,12 @@ extern "C"
     // from every thread without anyone answering who is allowed to draw.
     bool checkForQueueErrors() __attribute__((__hot__));
     size_t addToIOQueue(const void *buf, size_t size, size_t n, FSAFileHandle file) __attribute__((__hot__));
+    // Queue one complete block for a fixed file offset. Used by parallel downloads
+    // so an early slow range does not stop later completed ranges reaching storage.
+    size_t addToIOQueueAt(const void *buf, size_t size, FSAFileHandle file, uint32_t offset) __attribute__((__hot__));
+    // Queue a truncate after all previously queued writes to restore a valid prefix
+    // when a parallel transfer is cancelled or fails.
+    void truncateIOFileAt(FSAFileHandle file, uint32_t offset);
     void flushIOQueue();
     FSAFileHandle openFile(const char *patch, const char *mode, size_t filesize);
 
