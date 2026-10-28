@@ -44,6 +44,12 @@ jobs:
           docker run --rm -v ${PWD}:/project builder python3 build.py
           cat version.txt >> $GITHUB_OUTPUT
         id: version
+      - name: Upload development WUHB
+        uses: actions/upload-artifact@v7
+        with:
+          name: FASTspli-debug-${{ github.sha }}
+          path: out/Aroma-DEBUG/NUSspli.wuhb
+          if-no-files-found: error
       - name: Upload Aroma version
         if: ${{ startsWith(github.event.head_commit.message, 'v') && contains(github.event.head_commit.message, '.') && !endsWith(github.event.head_commit.message, '.') && (contains(github.event.head_commit.message, '-ALPHA') || contains(github.event.head_commit.message, '-BETA')) }}
         uses: actions/upload-artifact@v7
